@@ -1,0 +1,8 @@
+# Личный файл настроек с ключом API
+config.json
+cache/
+niches_*.xlsx
+__pycache__/
+*.pyc
+.venv/
+venv/
