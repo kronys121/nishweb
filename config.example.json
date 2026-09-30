@@ -28,6 +28,24 @@
   "suggest_as_queries": false,
   "suggest_max_per_query": 5,
 
+  "translate_check": true,
+  "translate_top_videos": 5,
+  "translate_source_langs": ["en"],
+  "translate_languages": [
+    {"lang": "cs", "region": "CZ"},
+    {"lang": "ro", "region": "RO"},
+    {"lang": "fr", "region": "FR"},
+    {"lang": "hu", "region": "HU"},
+    {"lang": "sr", "region": "RS"},
+    {"lang": "de", "region": "DE"},
+    {"lang": "ru", "region": "RU"}
+  ],
+  "translate_provider": "auto",
+  "serbian_script": "both",
+  "translate_min_views": 10000,
+  "translate_similarity": 0.5,
+  "translate_busy_count": 3,
+
   "daily_quota": 10000,
   "use_cache": true,
   "output_dir": "."

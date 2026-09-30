@@ -19,6 +19,7 @@ import shutil
 import statistics
 import sys
 import time
+import unicodedata
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -36,6 +37,8 @@ BASE_DIR = Path(__file__).resolve().parent
 CACHE_DIR = BASE_DIR / "cache"
 API_URL = "https://www.googleapis.com/youtube/v3/"
 SUGGEST_URL = "https://suggestqueries.google.com/complete/search"
+TRANSLATE_CLOUD_URL = "https://translation.googleapis.com/language/translate/v2"
+TRANSLATE_FREE_URL = "https://translate.googleapis.com/translate_a/single"
 
 # Стоимость одного вызова в единицах квоты.
 COST = {"search": 100, "videos": 1, "channels": 1}
@@ -65,9 +68,33 @@ DEFAULT_CONFIG = {
     "suggest": False,
     "suggest_as_queries": False,
     "suggest_max_per_query": 5,
+    "translate_check": False,
+    "translate_top_videos": 5,
+    "translate_source_langs": ["en"],
+    "translate_languages": [
+        {"lang": "cs", "region": "CZ"},
+        {"lang": "ro", "region": "RO"},
+        {"lang": "fr", "region": "FR"},
+        {"lang": "hu", "region": "HU"},
+        {"lang": "sr", "region": "RS"},
+        {"lang": "de", "region": "DE"},
+        {"lang": "ru", "region": "RU"},
+    ],
+    "translate_provider": "auto",
+    "serbian_script": "both",
+    "translate_min_views": 10000,
+    "translate_similarity": 0.5,
+    "translate_busy_count": 3,
     "daily_quota": 10000,
     "use_cache": True,
     "output_dir": ".",
+}
+
+LANG_NAMES = {
+    "cs": "Чешский", "ro": "Румынский", "fr": "Французский", "hu": "Венгерский", "sr": "Сербский",
+    "de": "Немецкий", "ru": "Русский", "en": "Английский", "pl": "Польский", "uk": "Украинский",
+    "es": "Испанский", "it": "Итальянский", "pt": "Португальский", "sk": "Словацкий", "bg": "Болгарский",
+    "hr": "Хорватский", "nl": "Нидерландский", "tr": "Турецкий",
 }
 
 
@@ -121,7 +148,13 @@ def load_config(path: Path) -> dict:
     if cfg["video_duration"] not in ("any", "medium", "long"):
         raise FinderError('video_duration должен быть "any", "medium" или "long".')
 
-    for name in ("published_after_days", "max_results_per_query", "suggest_max_per_query", "daily_quota"):
+    if cfg["translate_provider"] not in ("auto", "google_cloud", "google_free"):
+        raise FinderError('translate_provider должен быть "auto", "google_cloud" или "google_free".')
+    if cfg["serbian_script"] not in ("cyrillic", "latin", "both"):
+        raise FinderError('serbian_script должен быть "cyrillic", "latin" или "both".')
+
+    for name in ("published_after_days", "max_results_per_query", "suggest_max_per_query", "daily_quota",
+                 "translate_top_videos", "translate_min_views", "translate_similarity", "translate_busy_count"):
         value = cfg[name]
         if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0):
             raise FinderError(f"{name} должен быть неотрицательным числом (сейчас: {value!r}).")
@@ -151,6 +184,21 @@ def load_config(path: Path) -> dict:
             "source": "config",
         })
     cfg["queries"] = queries
+
+    languages = []
+    for i, item in enumerate(cfg.get("translate_languages") or [], 1):
+        if isinstance(item, str):
+            item = {"lang": item}
+        if not isinstance(item, dict) or not str(item.get("lang") or "").strip():
+            raise FinderError(f'Язык №{i} в translate_languages должен выглядеть так: {{"lang": "cs", "region": "CZ"}}.')
+        code = str(item["lang"]).strip().lower()
+        if code not in {x["lang"] for x in languages}:
+            languages.append({"lang": code, "region": str(item.get("region") or "").strip().upper()})
+    if cfg["translate_check"] and not languages:
+        raise FinderError("translate_check включён, но список translate_languages пуст.")
+    cfg["translate_languages"] = languages
+    cfg["translate_source_langs"] = [str(x).strip().lower() for x in cfg.get("translate_source_langs") or []]
+    cfg["translate_top_videos"] = int(cfg["translate_top_videos"] or 0)
     return cfg
 
 
@@ -428,6 +476,136 @@ def fetch_suggestions(session: requests.Session, cache: Cache, query: dict) -> l
     return suggestions
 
 
+# ---------------------------------------------------------------- перевод
+
+CLOUD_TRANSLATE_HELP = (
+    "Чтобы переводить через официальный Cloud Translation API, в Google Cloud Console того же проекта:\n"
+    "  1) APIs & Services > Library: найдите Cloud Translation API и нажмите Enable;\n"
+    "  2) Billing: подключите платёжный аккаунт (API тарифицируется по числу символов, "
+    "есть бесплатный месячный объём, условия на странице цен Cloud Translation);\n"
+    "  3) если у ключа включены API restrictions, добавьте в список Cloud Translation API."
+)
+
+SR_CYR_TO_LAT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "ђ": "đ", "е": "e", "ж": "ž", "з": "z", "и": "i",
+    "ј": "j", "к": "k", "л": "l", "љ": "lj", "м": "m", "н": "n", "њ": "nj", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "ћ": "ć", "у": "u", "ф": "f", "х": "h", "ц": "c", "ч": "č", "џ": "dž", "ш": "š",
+}
+
+
+def sr_to_latin(text: str) -> str:
+    out = []
+    for ch in text:
+        lat = SR_CYR_TO_LAT.get(ch.lower())
+        if lat is None:
+            out.append(ch)
+        else:
+            out.append(lat[0].upper() + lat[1:] if ch.isupper() else lat)
+    return "".join(out)
+
+
+def clean_title(title: str) -> str:
+    """Убирает хэштеги и эмодзи, чтобы переводилась только суть названия."""
+    text = re.sub(r"#\w+", " ", title)
+    text = "".join(ch for ch in text if unicodedata.category(ch) not in ("So", "Sk", "Cs", "Co"))
+    text = re.sub(r"\s+", " ", text).strip(" |-:")
+    return text or title
+
+
+def title_stems(text: str, lang: str) -> set[str]:
+    """Слова названия без регистра и диакритики, обрезанные до 5 букв (грубый учёт падежей)."""
+    text = text.lower()
+    if lang == "sr":
+        text = sr_to_latin(text)
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return {w[:5] for w in re.findall(r"\w+", text) if len(w) >= 3}
+
+
+def similarity(query_stems: set[str], title: str, lang: str) -> float:
+    """Какая доля слов переведённого названия встречается в названии найденного ролика."""
+    if not query_stems:
+        return 0.0
+    return len(query_stems & title_stems(title, lang)) / len(query_stems)
+
+
+class TranslateUnavailable(Exception):
+    pass
+
+
+class Translator:
+    def __init__(self, provider: str, api_key: str, cache: Cache, session: requests.Session):
+        self.provider = provider
+        self.api_key = api_key
+        self.cache = cache
+        self.session = session
+        self.store = cache.load_items("translations")
+
+    def translate(self, texts: list[str], target: str) -> list[str]:
+        missing = [t for t in dict.fromkeys(texts) if f"{target}|{t}" not in self.store]
+        if missing:
+            for text, result in zip(missing, self._translate(missing, target)):
+                self.store[f"{target}|{text}"] = result
+            self.cache.save_items("translations", self.store)
+        return [self.store[f"{target}|{t}"] for t in texts]
+
+    def _translate(self, texts: list[str], target: str) -> list[str]:
+        if self.provider in ("auto", "google_cloud"):
+            try:
+                return self._cloud(texts, target)
+            except TranslateUnavailable as exc:
+                if self.provider == "google_cloud":
+                    raise FinderError(f"Cloud Translation API недоступен: {exc}\n{CLOUD_TRANSLATE_HELP}") from None
+                print(f"  Cloud Translation API недоступен ({exc}).\n"
+                      "  Перевожу через бесплатный переводчик Google (неофициальный, может блокировать частые запросы).")
+                self.provider = "google_free"
+        try:
+            return [self._free(t, target) for t in texts]
+        except TranslateUnavailable as exc:
+            raise FinderError(f"Не удалось перевести названия: {exc}\n{CLOUD_TRANSLATE_HELP}") from None
+
+    def _cloud(self, texts: list[str], target: str) -> list[str]:
+        result = []
+        for start in range(0, len(texts), 100):
+            batch = texts[start:start + 100]
+            try:
+                resp = self.session.post(
+                    TRANSLATE_CLOUD_URL, params={"key": self.api_key},
+                    json={"q": batch, "target": target, "format": "text"}, timeout=30,
+                )
+            except requests.ConnectionError:
+                raise FinderError("Нет подключения к интернету. Проверьте соединение и запустите снова.") from None
+            except requests.Timeout:
+                raise TranslateUnavailable("сервер не ответил вовремя") from None
+            if resp.status_code != 200:
+                try:
+                    message = resp.json()["error"]["message"]
+                except (ValueError, KeyError, TypeError):
+                    message = f"код ответа {resp.status_code}"
+                raise TranslateUnavailable(message)
+            result += [t.get("translatedText", "") for t in resp.json()["data"]["translations"]]
+        return result
+
+    def _free(self, text: str, target: str) -> str:
+        params = {"client": "gtx", "sl": "auto", "tl": target, "dt": "t", "q": text}
+        try:
+            resp = self.session.get(TRANSLATE_FREE_URL, params=params, timeout=15,
+                                    headers={"User-Agent": "Mozilla/5.0"})
+        except requests.ConnectionError:
+            raise FinderError("Нет подключения к интернету. Проверьте соединение и запустите снова.") from None
+        except requests.Timeout:
+            raise TranslateUnavailable("бесплатный переводчик не ответил вовремя") from None
+        if resp.status_code != 200:
+            raise TranslateUnavailable(f"бесплатный переводчик ответил кодом {resp.status_code}")
+        try:
+            data = resp.json()
+            translated = "".join(seg[0] for seg in data[0] if seg and isinstance(seg[0], str)).strip()
+        except (ValueError, TypeError, IndexError):
+            raise TranslateUnavailable("бесплатный переводчик вернул неожиданный ответ") from None
+        time.sleep(0.3)
+        return translated or text
+
+
 # ---------------------------------------------------------------- расчёты
 
 DURATION_RE = re.compile(
@@ -534,6 +712,124 @@ def sort_key(row: dict):
     return (row["score"] is not None, row["score"] or 0, row["views"])
 
 
+# ---------------------------------------------------------------- проверка на других языках
+
+VERDICT_FREE, VERDICT_FEW, VERDICT_BUSY = "свободно", "мало конкурентов", "занято"
+
+
+def lang_name(code: str) -> str:
+    return LANG_NAMES.get(code, code)
+
+
+def translation_check(yt: YouTube, translator: Translator, final_rows: list[dict], queries: list[dict],
+                      cfg: dict, quota: Quota) -> tuple[list[dict], list[dict]]:
+    """Переводит названия лучших видео и ищет похожие ролики на других языках.
+
+    Возвращает (исходные видео, результаты по парам видео + язык).
+    """
+    src_langs = set(cfg["translate_source_langs"])
+    sources = [
+        r for r in final_rows
+        if r["score"] is not None
+        and (not src_langs or any(queries[i]["lang"].lower() in src_langs for i in r["query_idx"]))
+    ][:cfg["translate_top_videos"]]
+    if not sources:
+        print("\nПроверка на других языках: нет подходящих видео (проверьте translate_source_langs).")
+        return [], []
+    languages = [l for l in cfg["translate_languages"]]
+    print(f"\nПроверка на других языках: {len(sources)} видео, языки: "
+          + ", ".join(lang_name(l["lang"]) for l in languages))
+
+    titles = [clean_title(r["title"]) for r in sources]
+    variants: dict[tuple[int, str], list[str]] = {}
+    for lang in languages:
+        code = lang["lang"]
+        print(f"Перевод названий: {lang_name(code)}")
+        for k, text in enumerate(translator.translate(titles, code)):
+            options = [text]
+            if code == "sr":
+                latin = sr_to_latin(text)
+                options = {"cyrillic": [text], "latin": [latin],
+                           "both": list(dict.fromkeys([text, latin]))}[cfg["serbian_script"]]
+            variants[(k, code)] = options
+
+    check_cfg = {"order": "relevance", "video_duration": "any", "max_results_per_query": PAGE_SIZE}
+
+    def as_query(text: str, lang: dict) -> dict:
+        return {"q": text, "lang": lang["lang"], "region": lang["region"], "source": "translate"}
+
+    # Сколько видео можно проверить на оставшуюся квоту.
+    allowed, planned = 0, 0
+    for k in range(len(sources)):
+        searches = [as_query(v, l) for l in languages for v in variants[(k, l["lang"])]]
+        cost = sum(yt.search_cost_estimate(q, check_cfg, None) for q in searches)
+        cost += len(searches) * COST["videos"]
+        if planned + cost > quota.remaining:
+            break
+        planned += cost
+        allowed += 1
+    if allowed == 0:
+        print(f"Квоты не хватает даже на одно видео (осталось {quota.remaining} ед.). Проверка пропущена.")
+        return sources, []
+    if allowed < len(sources):
+        print(f"Квоты хватает только на {allowed} из {len(sources)} видео, остальные пропущены.")
+        sources = sources[:allowed]
+    print(f"Оценка расхода квоты на проверку: до {planned} ед.")
+
+    found: dict[tuple[int, str], list[str]] = {}
+    for k, row in enumerate(sources):
+        print(f"Видео {k + 1} из {len(sources)}: {short(titles[k])}")
+        for lang in languages:
+            code = lang["lang"]
+            ids: list[str] = []
+            for text in variants[(k, code)]:
+                try:
+                    got, _, _ = yt.search(as_query(text, lang), check_cfg, None)
+                except QueryError as exc:
+                    print(f"  {lang_name(code)}: запрос отклонён: {exc}")
+                    continue
+                ids += [i for i in got if i not in ids]
+            found[(k, code)] = ids
+        print(f"  квота за запуск: {quota.run_used} ед.")
+
+    all_ids = list(dict.fromkeys(i for ids in found.values() for i in ids))
+    print(f"Загрузка данных о {len(all_ids)} найденных видео...")
+    videos = yt.videos(all_ids)
+
+    results = []
+    threshold = cfg["translate_similarity"] or 0
+    min_views = cfg["translate_min_views"] or 0
+    busy = max(int(cfg["translate_busy_count"] or 1), 1)
+    for (k, code), ids in found.items():
+        stems = [title_stems(v, code) for v in variants[(k, code)]]
+        similar = []
+        for vid in ids:
+            video = videos.get(vid)
+            if not video or vid == sources[k]["id"]:
+                continue
+            title = (video.get("snippet") or {}).get("title", "")
+            sim = max(similarity(s, title, code) for s in stems)
+            if sim >= threshold:
+                views = int((video.get("statistics") or {}).get("viewCount", 0))
+                similar.append({"id": vid, "title": title, "views": views, "sim": sim})
+        competitors = [m for m in similar if m["views"] >= min_views]
+        best = max(competitors or similar, key=lambda m: m["views"]) if similar else None
+        if not competitors:
+            verdict = VERDICT_FREE
+        elif len(competitors) < busy:
+            verdict = VERDICT_FEW
+        else:
+            verdict = VERDICT_BUSY
+        results.append({
+            "k": k, "lang": code,
+            "region": next(l["region"] for l in languages if l["lang"] == code),
+            "translation": " / ".join(variants[(k, code)]),
+            "found": len(ids), "similar": len(similar), "competitors": len(competitors),
+            "best": best, "verdict": verdict,
+        })
+    return sources, results
+
+
 # ---------------------------------------------------------------- таблицы
 
 VIDEO_COLUMNS = ["Запрос", "Язык", "Название видео", "Ссылка на видео", "Канал", "Ссылка на канал",
@@ -634,21 +930,67 @@ def make_suggest_table(suggestions: list[tuple[dict, str, bool]]) -> pd.DataFram
     )
 
 
+def make_languages_table(sources: list[dict], results: list[dict], languages: list[dict]) -> pd.DataFrame:
+    """Сводка: строка на исходное видео, столбец на язык."""
+    by_key = {(r["k"], r["lang"]): r for r in results}
+    records = []
+    for k, row in enumerate(sources):
+        cells = []
+        for lang in languages:
+            res = by_key.get((k, lang["lang"]))
+            if res is None:
+                cells.append("не проверено")
+            elif res["verdict"] == VERDICT_FREE:
+                cells.append(VERDICT_FREE)
+            else:
+                cells.append(f"{res['verdict']} ({res['competitors']})")
+        free = sum(1 for c in cells if c == VERDICT_FREE)
+        records.append([row["title"], video_url(row["id"]), row["views"], round_or_none(row["ratio"], 2),
+                        round_or_none(row["score"], 3), free, *cells])
+    df = pd.DataFrame(records, columns=["Исходное видео", "Ссылка на видео", "Просмотры", "Ratio", "Score",
+                                        "Свободных языков", *[lang_name(l["lang"]) for l in languages]])
+    return df.sort_values(["Свободных языков", "Score"], ascending=False, kind="stable")
+
+
+def make_translations_table(sources: list[dict], results: list[dict], languages: list[dict]) -> pd.DataFrame:
+    order = {l["lang"]: i for i, l in enumerate(languages)}
+    records = []
+    for r in sorted(results, key=lambda x: (x["k"], order.get(x["lang"], 0))):
+        src = sources[r["k"]]
+        best = r["best"]
+        records.append([
+            src["title"], video_url(src["id"]), lang_name(r["lang"]), r["region"], r["translation"],
+            r["found"], r["similar"], r["competitors"],
+            best["title"] if best else None, video_url(best["id"]) if best else None,
+            best["views"] if best else None, round(best["sim"] * 100) if best else None, r["verdict"],
+        ])
+    return pd.DataFrame(records, columns=[
+        "Исходное видео", "Ссылка на видео", "Язык", "Регион", "Перевод названия", "Найдено в поиске",
+        "Похожих названий", "Конкурентов", "Самый популярный похожий", "Ссылка на похожий",
+        "Его просмотры", "Сходство, %", "Вердикт",
+    ])
+
+
 HEADER_FILL = PatternFill("solid", fgColor="DDE3EA")
 GREEN = PatternFill("solid", fgColor="C6EFCE")
 BRIGHT_GREEN = PatternFill("solid", fgColor="5BD75B")
+VERDICT_FILLS = {
+    VERDICT_FREE: PatternFill("solid", fgColor="C6EFCE"),
+    VERDICT_FEW: PatternFill("solid", fgColor="FFEB9C"),
+    VERDICT_BUSY: PatternFill("solid", fgColor="FFC7CE"),
+}
 
 NUMBER_FORMATS = {
     "Подписчики": "#,##0", "Просмотры": "#,##0", "Ratio": "0.00", "Просмотров в день": "#,##0",
     "Длительность, мин": "0.0", "Дата публикации": "yyyy-mm-dd", "Score": "0.000",
     "Средние просмотры": "#,##0", "Медианные просмотры": "#,##0", "Лучший ratio": "0.00",
     "Оценка ниши": "0.000", "Просмотры лучшего": "#,##0", "Ratio лучшего": "0.00",
-    "Score лучшего": "0.000", "Видео на канале": "#,##0",
+    "Score лучшего": "0.000", "Видео на канале": "#,##0", "Его просмотры": "#,##0",
 }
-LINK_COLUMNS = {"Ссылка на видео", "Ссылка на канал", "Ссылка на ролик"}
+LINK_COLUMNS = {"Ссылка на видео", "Ссылка на канал", "Ссылка на ролик", "Ссылка на похожий"}
 
 
-def format_sheet(ws, df: pd.DataFrame, ratio_highlight: bool = False) -> None:
+def format_sheet(ws, df: pd.DataFrame, highlight: str | None = None) -> None:
     columns = list(df.columns)
     for cell in ws[1]:
         cell.font = Font(bold=True)
@@ -674,7 +1016,7 @@ def format_sheet(ws, df: pd.DataFrame, ratio_highlight: bool = False) -> None:
                 cell.hyperlink = cell.value
                 cell.style = "Hyperlink"
 
-    if ratio_highlight and "Ratio" in columns:
+    if highlight == "ratio" and "Ratio" in columns:
         for row_idx, ratio in enumerate(df["Ratio"].tolist(), start=2):
             if ratio is None or ratio != ratio:
                 continue
@@ -683,15 +1025,23 @@ def format_sheet(ws, df: pd.DataFrame, ratio_highlight: bool = False) -> None:
                 for col_idx in range(1, len(columns) + 1):
                     ws.cell(row=row_idx, column=col_idx).fill = fill
 
+    if highlight == "verdict":
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                if isinstance(cell.value, str):
+                    fill = VERDICT_FILLS.get(cell.value.split(" (")[0])
+                    if fill:
+                        cell.fill = fill
 
-def write_excel(path: Path, sheets: list[tuple[str, pd.DataFrame, bool]]) -> None:
+
+def write_excel(path: Path, sheets: list[tuple[str, pd.DataFrame, str | None]]) -> None:
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         for name, df, highlight in sheets:
             df.to_excel(writer, sheet_name=name, index=False)
             format_sheet(writer.sheets[name], df, highlight)
 
 
-def save_report(cfg: dict, sheets: list[tuple[str, pd.DataFrame, bool]]) -> Path:
+def save_report(cfg: dict, sheets: list[tuple[str, pd.DataFrame, str | None]]) -> Path:
     out_dir = Path(cfg["output_dir"] or ".")
     if not out_dir.is_absolute():
         out_dir = BASE_DIR / out_dir
@@ -760,6 +1110,12 @@ def run(config_path: Path) -> None:
     estimate = search_cost + lookup_cost
     print(f"\nЗапросов: {len(queries)}. Оценка расхода квоты: до {estimate} ед., "
           f"осталось {quota.remaining} из {quota.limit}.")
+    if cfg["translate_check"]:
+        per_video = sum(2 if (l["lang"] == "sr" and cfg["serbian_script"] == "both") else 1
+                        for l in cfg["translate_languages"])
+        extra = cfg["translate_top_videos"] * per_video * (COST["search"] + COST["videos"])
+        print(f"Проверка на других языках потратит ещё до {extra} ед. "
+              "(если квоты не хватит, проверим меньше видео).")
     if estimate > quota.remaining:
         raise QuotaError(
             f"Квоты не хватает: для запуска нужно до {estimate} ед., а осталось {quota.remaining}.\n"
@@ -808,19 +1164,35 @@ def run(config_path: Path) -> None:
     final_rows = sorted((r for r in all_rows if r["base_ok"] and passes_subs(r, cfg)), key=sort_key, reverse=True)
     final_ids = {r["id"] for r in final_rows}
 
+    # 6. Проверка лучших видео на других языках.
+    sources, check_results = [], []
+    if cfg["translate_check"] and cfg["translate_top_videos"] > 0:
+        translator = Translator(cfg["translate_provider"], cfg["api_key"], cache, yt.session)
+        try:
+            sources, check_results = translation_check(yt, translator, final_rows, queries, cfg, quota)
+        except FinderError as exc:
+            print(f"\nПроверка на других языках прервана: {exc}\nОсновной отчёт всё равно будет сохранён.")
+
     sheets = [
-        ("Видео", make_video_table(final_rows, queries), True),
-        ("Ниши", make_niche_table(all_rows, final_ids, queries, failed, cfg), False),
-        ("Каналы", make_channel_table(final_rows), False),
+        ("Видео", make_video_table(final_rows, queries), "ratio"),
+        ("Ниши", make_niche_table(all_rows, final_ids, queries, failed, cfg), None),
     ]
+    if check_results:
+        sheets.append(("Языки", make_languages_table(sources, check_results, cfg["translate_languages"]), "verdict"))
+        sheets.append(("Переводы", make_translations_table(sources, check_results, cfg["translate_languages"]), "verdict"))
+    sheets.append(("Каналы", make_channel_table(final_rows), None))
     if cfg["suggest"]:
-        sheets.append(("Подсказки", make_suggest_table(suggestions), False))
+        sheets.append(("Подсказки", make_suggest_table(suggestions), None))
     path = save_report(cfg, sheets)
 
     hidden = sum(1 for r in final_rows if r["hidden"])
     print(f"\nУникальных видео найдено: {len(all_rows)}, прошли фильтры: {len(final_rows)}"
           + (f" (из них со скрытыми подписчиками: {hidden})" if hidden else "") + ".")
     print(f"Каналов в отчёте: {len({r['channel_id'] for r in final_rows})}.")
+    if check_results:
+        free = sum(1 for r in check_results if r["verdict"] == VERDICT_FREE)
+        print(f"Проверка на других языках: свободно {free} из {len(check_results)} пар видео и язык "
+              "(подробно на листах «Языки» и «Переводы»).")
     print(quota.summary())
     print(f"Отчёт сохранён: {path}")
 
